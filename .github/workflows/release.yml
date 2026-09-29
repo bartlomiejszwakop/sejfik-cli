@@ -1,0 +1,58 @@
+name: release
+
+# Wydanie powstaje z tagu vX.Y.Z. Do wydania trafia sam plik `sejfik`
+# oraz SHA256SUMS — instalator sprawdza sumę, więc bez niej nie zadziała.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Najstarszy wspierany Python i bieżący — CLI ma stać na maszynach,
+        # na których nikt nie aktualizuje interpretera.
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Testy
+        run: python3 tests/test_sejfik.py
+      - name: Instalator przechodzi shellcheck
+        run: shellcheck install.sh
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wersja w tagu zgadza się z wersją w kodzie
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          kod="$(python3 -c 'import re,pathlib; print(re.search(r"__version__ = \"([^\"]+)\"", pathlib.Path("sejfik").read_text()).group(1))')"
+          if [ "$tag" != "$kod" ]; then
+            echo "tag $tag, a __version__ w kodzie to $kod" >&2
+            exit 1
+          fi
+
+      - name: Sumy kontrolne
+        run: sha256sum sejfik install.sh > SHA256SUMS
+
+      - name: Wydanie
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            sejfik
+            install.sh
+            SHA256SUMS
+          generate_release_notes: true

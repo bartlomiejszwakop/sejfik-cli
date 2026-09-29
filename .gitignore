@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+SHA256SUMS
+dist/

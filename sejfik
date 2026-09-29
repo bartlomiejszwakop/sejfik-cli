@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""sejfik — sekrety z Sejfika bez przepuszczania ich przez terminal.
+
+Agent i człowiek operują referencją:
+
+    sejfik://item/{id}/{pole}          pole: password | totp_code | login
+
+Referencja jest adresem, nie sekretem. Może leżeć w repozytorium,
+w konfiguracji i w rozmowie z agentem — bez tokenu i bez wpisu w teczce
+agenta nie daje nikomu niczego.
+
+Zero zależności poza standardową biblioteką Pythona 3.9+.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import stat
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Iterable
+
+__version__ = "1.0.0"
+
+CONFIG_DIR = Path(os.environ.get("SEJFIK_HOME", Path.home() / ".sejfik"))
+TOKEN_FILE = CONFIG_DIR / "token"
+CONFIG_FILE = CONFIG_DIR / "config"
+
+REF_PATTERN = re.compile(r"^sejfik://item/(\d+)/(password|totp_code|login)$")
+# {{ sejfik://item/12/password }} — spacje w środku są opcjonalne.
+TEMPLATE_PATTERN = re.compile(r"\{\{\s*(sejfik://[^\s}]+)\s*\}\}")
+
+HTTP_TIMEOUT = 20
+
+
+class SejfikError(Exception):
+    """Błąd, który ma trafić do użytkownika jako jedno zdanie, nie jako ślad stosu."""
+
+
+# --------------------------------------------------------------------------
+# Konfiguracja
+# --------------------------------------------------------------------------
+
+
+def read_config() -> dict[str, str]:
+    """Plik ~/.sejfik/config w postaci klucz=wartość. Nie musi istnieć."""
+    if not CONFIG_FILE.exists():
+        return {}
+
+    config: dict[str, str] = {}
+    for line in CONFIG_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        config[key.strip().lower()] = value.strip()
+    return config
+
+
+def resolve_url(explicit: str | None) -> str:
+    url = explicit or os.environ.get("SEJFIK_URL") or read_config().get("url")
+    if not url:
+        raise SejfikError(
+            "nie wiem, gdzie stoi Sejfik. Ustaw SEJFIK_URL=https://... "
+            f"albo wpisz url=https://... do {CONFIG_FILE}"
+        )
+    if not url.startswith(("http://", "https://")):
+        raise SejfikError(f"adres Sejfika musi zaczynać się od http:// lub https:// — dostałem {url!r}")
+    return url.rstrip("/")
+
+
+def read_token() -> str:
+    """Token osobisty (PAT) ze zmiennej środowiskowej albo z pliku.
+
+    Plik musi być czytelny wyłącznie dla właściciela. Token daje dostęp do
+    teczki agenta, więc `chmod 644` na nim to cicha dziura — lepiej odmówić
+    głośno niż działać.
+    """
+    token = os.environ.get("SEJFIK_TOKEN") or os.environ.get("SEJFIK_AGENT_TOKEN")
+    if token:
+        return token.strip()
+
+    if not TOKEN_FILE.exists():
+        raise SejfikError(
+            f"brak tokenu. Ustaw SEJFIK_TOKEN albo zapisz go w {TOKEN_FILE} "
+            "(prawa 600). Token wygenerujesz w Sejfiku: Konto → tokeny MCP."
+        )
+
+    mode = TOKEN_FILE.stat().st_mode
+    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise SejfikError(
+            f"{TOKEN_FILE} jest czytelny dla innych użytkowników. Napraw: chmod 600 {TOKEN_FILE}"
+        )
+
+    token = TOKEN_FILE.read_text(encoding="utf-8").strip()
+    if not token:
+        raise SejfikError(f"{TOKEN_FILE} jest pusty.")
+    return token
+
+
+# --------------------------------------------------------------------------
+# Rozmowa z Sejfikiem
+# --------------------------------------------------------------------------
+
+
+def _call(url: str, token: str, path: str, payload: dict | None = None) -> dict:
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(
+        url + path,
+        data=data,
+        method="POST" if data is not None else "GET",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": f"sejfik-cli/{__version__}",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        detail = ""
+        try:
+            detail = json.loads(error.read().decode("utf-8")).get("error", "")
+        except Exception:
+            pass
+        if error.code == 401:
+            raise SejfikError("Sejfik nie uznał tokenu (401). Sprawdź go: sejfik whoami") from None
+        raise SejfikError(f"Sejfik odmówił ({error.code}). {detail}".strip()) from None
+    except urllib.error.URLError as error:
+        raise SejfikError(f"nie udało się połączyć z Sejfikiem: {error.reason}") from None
+
+
+class Resolver:
+    """Rozwiązuje referencje i pamięta wynik w obrębie jednego uruchomienia.
+
+    Szablon potrafi wołać ten sam sekret kilka razy; nie ma powodu, żeby
+    za każdym razem był osobny wpis w audycie i osobne żądanie.
+    """
+
+    def __init__(self, url: str, token: str, reason: str) -> None:
+        self.url = url
+        self.token = token
+        self.reason = reason
+        self._cache: dict[str, str] = {}
+
+    def __call__(self, ref: str) -> str:
+        if ref in self._cache:
+            return self._cache[ref]
+
+        if not REF_PATTERN.match(ref):
+            raise SejfikError(
+                f"{ref!r} to nie jest referencja. Oczekiwano sejfik://item/{{id}}/{{password|totp_code|login}}. "
+                "Nie podawaj tu wartości sekretu."
+            )
+
+        body = _call(self.url, self.token, "/api/vault/agent/resolve", {"ref": ref, "reason": self.reason})
+        value = body.get("value")
+        if not value:
+            raise SejfikError(f"Sejfik nie zwrócił wartości dla {ref}.")
+
+        self._cache[ref] = value
+        return value
+
+
+# --------------------------------------------------------------------------
+# Polecenia
+# --------------------------------------------------------------------------
+
+
+def parse_assignment(assignment: str) -> tuple[str, str]:
+    """NAZWA=sejfik://... → ('NAZWA', 'sejfik://...')."""
+    name, sep, ref = assignment.partition("=")
+    if not sep or not name.strip():
+        raise SejfikError(f"--env oczekuje NAZWA=sejfik://..., dostałem {assignment!r}")
+    return name.strip(), ref.strip()
+
+
+def child_environment(pairs: Iterable[tuple[str, str]], resolve: Resolver) -> dict[str, str]:
+    env = os.environ.copy()
+    # Token nie ma czego szukać w procesie potomnym — to on jest kluczem
+    # do całej teczki agenta, a potomek dostaje tylko to, co zamówiono.
+    for leaked in ("SEJFIK_TOKEN", "SEJFIK_AGENT_TOKEN"):
+        env.pop(leaked, None)
+
+    for name, ref in pairs:
+        env[name] = resolve(ref)
+    return env
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    if not args.command:
+        raise SejfikError("brakuje polecenia. Użycie: sejfik run --env NAZWA=ref -- polecenie")
+    if not args.env and not args.stdin:
+        raise SejfikError("nie podałeś, co wstrzyknąć. Dodaj --env NAZWA=ref albo --stdin ref")
+
+    resolve = Resolver(resolve_url(args.url), read_token(), args.reason)
+    pairs = [parse_assignment(item) for item in args.env]
+    env = child_environment(pairs, resolve)
+
+    command = args.command[1:] if args.command and args.command[0] == "--" else args.command
+
+    if args.stdin:
+        secret = resolve(args.stdin)
+        import subprocess
+
+        process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE)
+        process.communicate(input=(secret + "\n").encode("utf-8"))
+        return process.returncode
+
+    # Bez --stdin podmieniamy proces: potomek dziedziczy wszystkie strumienie
+    # i sygnały, a sejfik znika z drzewa procesów razem z rozwiązanym sekretem.
+    try:
+        os.execvpe(command[0], command, env)
+    except FileNotFoundError:
+        raise SejfikError(f"nie znalazłem polecenia {command[0]!r}") from None
+    return 0  # nieosiągalne
+
+
+def cmd_read(args: argparse.Namespace) -> int:
+    if sys.stdout.isatty() and not args.force:
+        raise SejfikError(
+            "odmawiam wypisania sekretu na terminal — zostałby w scrollbacku i w nagraniu sesji. "
+            "Przekieruj go (sejfik read REF > plik), podaj potokiem, albo wymuś --force."
+        )
+
+    resolve = Resolver(resolve_url(args.url), read_token(), args.reason)
+    sys.stdout.write(resolve(args.ref))
+    if args.newline:
+        sys.stdout.write("\n")
+    return 0
+
+
+def cmd_inject(args: argparse.Namespace) -> int:
+    source = sys.stdin.read() if args.input == "-" else Path(args.input).read_text(encoding="utf-8")
+
+    refs = TEMPLATE_PATTERN.findall(source)
+    if not refs:
+        raise SejfikError(
+            "szablon nie zawiera żadnej referencji. Oczekiwano {{ sejfik://item/12/password }}"
+        )
+
+    resolve = Resolver(resolve_url(args.url), read_token(), args.reason)
+    filled = TEMPLATE_PATTERN.sub(lambda match: resolve(match.group(1)), source)
+
+    if args.output == "-":
+        if sys.stdout.isatty() and not args.force:
+            raise SejfikError(
+                "odmawiam wypisania wypełnionego szablonu na terminal. "
+                "Podaj -o PLIK albo przekieruj wyjście."
+            )
+        sys.stdout.write(filled)
+        return 0
+
+    target = Path(args.output)
+    if target.exists() and not args.force:
+        raise SejfikError(f"{target} już istnieje. Użyj --force, żeby nadpisać.")
+
+    # Zapis atomowy: plik pojawia się od razu kompletny i od razu z właściwymi
+    # prawami. Inaczej byłaby chwila, w której sekret leży czytelny dla wszystkich.
+    handle, temporary = tempfile.mkstemp(dir=target.parent or Path("."), prefix=".sejfik-")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(filled)
+        os.chmod(temporary, int(args.mode, 8))
+        os.replace(temporary, target)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+    print(f"{target} — wypełniono {plural_refs(len(set(refs)))}", file=sys.stderr)
+    return 0
+
+
+
+def plural_refs(count: int) -> str:
+    """1 referencję, 2 referencje, 5 referencji — polska odmiana po liczebniku."""
+    if count == 1:
+        return "1 referencję"
+    last_two = count % 100
+    last = count % 10
+    if 2 <= last <= 4 and not 12 <= last_two <= 14:
+        return f"{count} referencje"
+    return f"{count} referencji"
+
+
+def cmd_whoami(args: argparse.Namespace) -> int:
+    body = _call(resolve_url(args.url), read_token(), "/api/vault/agent/whoami")
+    actor = body.get("actor", {})
+    print(f"{actor.get('name', '?')} (id {actor.get('id', '?')})")
+    print(f"wpisów w teczce agenta: {body.get('available', '?')}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Wejście
+# --------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sejfik",
+        description="Sekrety z Sejfika bez przepuszczania ich przez terminal.",
+        epilog="Referencja ma postać sejfik://item/{id}/{password|totp_code|login}",
+    )
+    parser.add_argument("--version", action="version", version=f"sejfik {__version__}")
+    parser.add_argument("--url", help="adres Sejfika (domyślnie SEJFIK_URL albo ~/.sejfik/config)")
+    parser.add_argument("--reason", default="sejfik-cli", help="powód — trafia do audytu Sejfika")
+
+    subparsers = parser.add_subparsers(dest="command_name", required=True)
+
+    run = subparsers.add_parser("run", help="uruchom polecenie z sekretem w środowisku")
+    run.add_argument("--env", action="append", default=[], metavar="NAZWA=REF",
+                     help="wstrzyknij sekret jako zmienną środowiskową (można podać wiele razy)")
+    run.add_argument("--stdin", metavar="REF", help="podaj sekret na standardowe wejście polecenia")
+    run.add_argument("command", nargs=argparse.REMAINDER, help="-- polecenie do uruchomienia")
+    run.set_defaults(handler=cmd_run)
+
+    inject = subparsers.add_parser("inject", help="wypełnij szablon konfiguracji")
+    inject.add_argument("-i", "--input", required=True, help="szablon ('-' czyta standardowe wejście)")
+    inject.add_argument("-o", "--output", required=True, help="plik wynikowy ('-' pisze na wyjście)")
+    inject.add_argument("--mode", default="600", help="prawa pliku wynikowego, ósemkowo (domyślnie 600)")
+    inject.add_argument("--force", action="store_true", help="nadpisz istniejący plik")
+    inject.set_defaults(handler=cmd_inject)
+
+    read = subparsers.add_parser("read", help="wypisz sekret na standardowe wyjście")
+    read.add_argument("ref", help="sejfik://item/{id}/{pole}")
+    read.add_argument("-n", "--newline", action="store_true", help="dopisz znak nowej linii")
+    read.add_argument("--force", action="store_true", help="pozwól wypisać także na terminal")
+    read.set_defaults(handler=cmd_read)
+
+    whoami = subparsers.add_parser("whoami", help="sprawdź token i pokaż, czyim jesteś")
+    whoami.set_defaults(handler=cmd_whoami)
+
+    return parser
+
+
+def translate_legacy(argv: list[str]) -> list[str]:
+    """Stare wywołanie sejfik-run na nową składnię.
+
+        sejfik-run --ref R --env NAZWA -- polecenie
+        sejfik-run --ref R --stdin     -- polecenie
+
+    Narzędzie krążyło po maszynach pod tą nazwą, zanim dostało
+    podpolecenia. Łamanie tego bez powodu tylko kazałoby ludziom
+    wrócić do wklejania sekretów ręcznie.
+    """
+    legacy = argparse.ArgumentParser(prog="sejfik-run", add_help=False)
+    legacy.add_argument("--ref", required=True)
+    legacy.add_argument("--env")
+    legacy.add_argument("--stdin", action="store_true")
+    legacy.add_argument("--reason", default="sejfik-run")
+    legacy.add_argument("--url")
+    legacy.add_argument("command", nargs=argparse.REMAINDER)
+
+    old = legacy.parse_args(argv)
+    new = ["--reason", old.reason]
+    if old.url:
+        new += ["--url", old.url]
+    new.append("run")
+
+    if old.stdin:
+        new += ["--stdin", old.ref]
+    else:
+        if not old.env:
+            raise SejfikError("stare wywołanie wymaga --env NAZWA albo --stdin")
+        new += ["--env", f"{old.env}={old.ref}"]
+
+    return new + old.command
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+
+    try:
+        if Path(sys.argv[0]).name == "sejfik-run":
+            raw = translate_legacy(raw)
+    except SejfikError as error:
+        print(f"sejfik-run: {error}", file=sys.stderr)
+        return 2
+
+    args = build_parser().parse_args(raw)
+    try:
+        return args.handler(args)
+    except SejfikError as error:
+        print(f"sejfik: {error}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
