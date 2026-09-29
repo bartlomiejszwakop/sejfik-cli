@@ -26,7 +26,7 @@ import urllib.request
 from pathlib import Path
 from typing import Iterable
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 CONFIG_DIR = Path(os.environ.get("SEJFIK_HOME", Path.home() / ".sejfik"))
 TOKEN_FILE = CONFIG_DIR / "token"
@@ -205,7 +205,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not args.env and not args.stdin:
         raise SejfikError("nie podałeś, co wstrzyknąć. Dodaj --env NAZWA=ref albo --stdin ref")
 
-    resolve = Resolver(resolve_url(args.url), read_token(), args.reason)
+    resolve = Resolver(resolve_url(args.url_base), read_token(), args.reason)
     pairs = [parse_assignment(item) for item in args.env]
     env = child_environment(pairs, resolve)
 
@@ -235,7 +235,7 @@ def cmd_read(args: argparse.Namespace) -> int:
             "Przekieruj go (sejfik read REF > plik), podaj potokiem, albo wymuś --force."
         )
 
-    resolve = Resolver(resolve_url(args.url), read_token(), args.reason)
+    resolve = Resolver(resolve_url(args.url_base), read_token(), args.reason)
     sys.stdout.write(resolve(args.ref))
     if args.newline:
         sys.stdout.write("\n")
@@ -251,7 +251,7 @@ def cmd_inject(args: argparse.Namespace) -> int:
             "szablon nie zawiera żadnej referencji. Oczekiwano {{ sejfik://item/12/password }}"
         )
 
-    resolve = Resolver(resolve_url(args.url), read_token(), args.reason)
+    resolve = Resolver(resolve_url(args.url_base), read_token(), args.reason)
     filled = TEMPLATE_PATTERN.sub(lambda match: resolve(match.group(1)), source)
 
     if args.output == "-":
@@ -296,7 +296,7 @@ def plural_refs(count: int) -> str:
 
 
 def cmd_whoami(args: argparse.Namespace) -> int:
-    body = _call(resolve_url(args.url), read_token(), "/api/vault/agent/whoami")
+    body = _call(resolve_url(args.url_base), read_token(), "/api/vault/agent/whoami")
     actor = body.get("actor", {})
     print(f"{actor.get('name', '?')} (id {actor.get('id', '?')})")
     print(f"wpisów w teczce agenta: {body.get('available', '?')}")
@@ -315,7 +315,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Referencja ma postać sejfik://item/{id}/{password|totp_code|login}",
     )
     parser.add_argument("--version", action="version", version=f"sejfik {__version__}")
-    parser.add_argument("--url", help="adres Sejfika (domyślnie SEJFIK_URL albo ~/.sejfik/config)")
+    parser.add_argument("--url", dest="url_base",
+                        help="adres Sejfika (domyślnie SEJFIK_URL albo ~/.sejfik/config)")
     parser.add_argument("--reason", default="sejfik-cli", help="powód — trafia do audytu Sejfika")
 
     subparsers = parser.add_subparsers(dest="command_name", required=True)
@@ -343,7 +344,85 @@ def build_parser() -> argparse.ArgumentParser:
     whoami = subparsers.add_parser("whoami", help="sprawdź token i pokaż, czyim jesteś")
     whoami.set_defaults(handler=cmd_whoami)
 
+    create = subparsers.add_parser(
+        "create-login",
+        help="załóż wpis z nowym, wygenerowanym hasłem",
+        description="Hasło generuje Sejfik i tam zostaje. Na wyjście idzie sama referencja, "
+                    "więc REF=$(sejfik create-login --name X) działa tak, jak wygląda.",
+    )
+    create.add_argument("--name", required=True, help="nazwa wpisu")
+    create.add_argument("--url", dest="url", help="adres serwisu")
+    create.add_argument("--username", help="login, jeśli już znany")
+    create.add_argument("--length", type=int, help="długość hasła (domyślnie 24)")
+    create.set_defaults(handler=cmd_create_login)
+
+    rotate = subparsers.add_parser("rotate-password", help="nowe hasło dla istniejącego wpisu")
+    rotate.add_argument("item", help="numer wpisu albo sejfik://item/{id}/password")
+    rotate.add_argument("--length", type=int, help="długość hasła (domyślnie 24)")
+    rotate.set_defaults(handler=cmd_rotate_password)
+
     return parser
+
+
+
+def item_id_from(target: str) -> int:
+    """Przyjmuje 1608 albo sejfik://item/1608/password — obie formy krążą."""
+    target = target.strip()
+    if target.isdigit():
+        return int(target)
+
+    match = REF_PATTERN.match(target)
+    if match:
+        return int(match.group(1))
+
+    raise SejfikError(f"{target!r} to nie jest ani numer wpisu, ani referencja.")
+
+
+def report_ref(ref: str, human: str) -> None:
+    """Referencja na wyjście, opis na strumień błędów.
+
+    Dzięki temu `REF=$(sejfik create-login --name X)` łapie samą
+    referencję, a człowiek i tak widzi, co się stało.
+    """
+    print(human, file=sys.stderr)
+    print(ref)
+
+
+def cmd_create_login(args: argparse.Namespace) -> int:
+    payload: dict[str, object] = {"name": args.name}
+    if args.url:
+        payload["url"] = args.url
+    if args.username:
+        payload["username"] = args.username
+    if args.length:
+        payload["length"] = args.length
+
+    body = _call(resolve_url(args.url_base), read_token(), "/api/vault/agent/items", payload)
+    ref = body.get("password_ref")
+    if not ref:
+        raise SejfikError("Sejfik nie zwrócił referencji.")
+
+    report_ref(ref, f"Wpis {body.get('item_id')} „{body.get('name')}” założony. "
+                    "Hasło wygenerował Sejfik i tam zostało — tutaj go nie ma.")
+    return 0
+
+
+def cmd_rotate_password(args: argparse.Namespace) -> int:
+    item = item_id_from(args.item)
+    body = _call(
+        resolve_url(args.url_base),
+        read_token(),
+        f"/api/vault/agent/items/{item}/rotate",
+        {"length": args.length} if args.length else {},
+    )
+    ref = body.get("password_ref")
+    if not ref:
+        raise SejfikError("Sejfik nie zwrócił referencji.")
+
+    report_ref(ref, f"Wpis {body.get('item_id')} „{body.get('name')}” ma nowe hasło. "
+                    "Poprzednie zostało w historii wpisu. "
+                    "Pamiętaj, że to zmiana w Sejfiku, a nie w serwisie po drugiej stronie.")
+    return 0
 
 
 def translate_legacy(argv: list[str]) -> list[str]:

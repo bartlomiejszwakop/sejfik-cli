@@ -95,6 +95,37 @@ sejfik read sejfik://item/1523/password | docker secret create klucz -
 
 `read` **odmówi wypisania sekretu na terminal**, bo zostałby w scrollbacku i w nagraniu sesji. Świadome obejście: `--force`.
 
+### `create-login` — nowe hasło, którego nikt nie widzi
+
+```bash
+sejfik create-login --name "Sklep ALSO" --url https://also.com --username bartek
+```
+
+Hasło generuje **Sejfik** i tam zostaje. Gdyby generował je agent albo
+model językowy, wartość przeszłaby przez rozmowę — a o to właśnie chodzi,
+żeby nie przeszła.
+
+Na standardowe wyjście idzie sama referencja, opis na strumień błędów, więc
+to działa tak, jak wygląda:
+
+```bash
+REF=$(sejfik create-login --name "Sklep ALSO")
+sejfik run --env HASLO="$REF" -- ./zaloz-konto.sh
+```
+
+### `rotate-password` — nowe hasło dla istniejącego wpisu
+
+```bash
+sejfik rotate-password 1608
+sejfik rotate-password sejfik://item/1608/password    # obie formy działają
+```
+
+Poprzednie hasło zostaje w historii wpisu, więc rotacja, która nie zdążyła
+dojechać do serwisu po drugiej stronie, nie zostawia nikogo bez dostępu.
+
+Uwaga: to zmienia hasło **w Sejfiku**, a nie w serwisie. Ustawienie go tam
+to osobny krok i nikt go za Ciebie nie zrobi.
+
 ### `whoami`
 
 ```bash

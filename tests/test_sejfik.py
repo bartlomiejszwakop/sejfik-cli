@@ -58,6 +58,20 @@ class FakeSejfik(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         payload = json.loads(self.rfile.read(length) or b"{}")
 
+        if self.path == "/api/vault/agent/items":
+            if not payload.get("name"):
+                return self._json(422, {"ok": False, "error": "Wpis musi mieć nazwę."})
+            return self._json(201, {
+                "ok": True, "item_id": 1608, "name": payload["name"],
+                "password_ref": "sejfik://item/1608/password",
+            })
+
+        if self.path == "/api/vault/agent/items/1608/rotate":
+            return self._json(200, {
+                "ok": True, "item_id": 1608, "name": "Sklep",
+                "password_ref": "sejfik://item/1608/password",
+            })
+
         if self.path != "/api/vault/agent/resolve":
             return self._json(404, {"ok": False, "error": "nie ma"})
 
@@ -252,6 +266,44 @@ class TestZgodnoscWstecz(Base):
         wynik = self._przez_dowiazanie(["--ref", "sejfik://item/12/password", "--", "true"])
         self.assertEqual(2, wynik.returncode)
         self.assertIn("--env", wynik.stderr)
+
+
+class TestZakladanie(Base):
+    def _run(self, args: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(ROOT / "sejfik"), *args],
+            capture_output=True, text=True, env=os.environ.copy(), timeout=30,
+        )
+
+    def test_na_wyjscie_idzie_sama_referencja(self):
+        wynik = self._run(["create-login", "--name", "Sklep ALSO", "--url", "https://also.com"])
+        self.assertEqual(0, wynik.returncode, wynik.stderr)
+        # Dokładnie to, co złapie REF=$(sejfik create-login ...).
+        self.assertEqual("sejfik://item/1608/password", wynik.stdout.strip())
+        # Opis dla człowieka nie zaśmieca wyjścia.
+        self.assertIn("Sklep ALSO", wynik.stderr)
+
+    def test_odpowiedz_nie_zawiera_hasla(self):
+        wynik = self._run(["create-login", "--name", "Sklep"])
+        self.assertNotIn("password=", wynik.stdout + wynik.stderr)
+        self.assertEqual(1, (wynik.stdout + wynik.stderr).count("sejfik://item/1608/password"))
+
+    def test_rotacja_przyjmuje_numer_i_referencje(self):
+        for cel in ("1608", "sejfik://item/1608/password"):
+            wynik = self._run(["rotate-password", cel])
+            self.assertEqual(0, wynik.returncode, wynik.stderr)
+            self.assertEqual("sejfik://item/1608/password", wynik.stdout.strip())
+            self.assertIn("historii wpisu", wynik.stderr)
+
+    def test_rotacja_odrzuca_bzdurny_cel(self):
+        wynik = self._run(["rotate-password", "moje-haslo"])
+        self.assertEqual(2, wynik.returncode)
+        self.assertIn("ani numer wpisu, ani referencja", wynik.stderr)
+
+    def test_blad_serwera_dociera_do_uzytkownika(self):
+        wynik = self._run(["rotate-password", "999"])
+        self.assertEqual(2, wynik.returncode)
+        self.assertIn("sejfik:", wynik.stderr)
 
 
 if __name__ == "__main__":
