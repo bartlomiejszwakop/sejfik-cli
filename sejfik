@@ -133,7 +133,10 @@ def _call(url: str, token: str, path: str, payload: dict | None = None) -> dict:
         except Exception:
             pass
         if error.code == 401:
-            raise SejfikError("Sejfik nie uznał tokenu (401). Sprawdź go: sejfik whoami") from None
+            raise SejfikError(
+                "Sejfik nie uznał tokenu (401). Wygasł albo został odwołany — "
+                "wygeneruj nowy w Sejfiku: Konto → tokeny MCP."
+            ) from None
         raise SejfikError(f"Sejfik odmówił ({error.code}). {detail}".strip()) from None
     except urllib.error.URLError as error:
         raise SejfikError(f"nie udało się połączyć z Sejfikiem: {error.reason}") from None
