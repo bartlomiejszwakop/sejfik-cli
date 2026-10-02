@@ -34,7 +34,16 @@ install -m 600 /dev/stdin ~/.sejfik/token   # wklej, Ctrl-D
 sejfik whoami
 ```
 
-`sejfik` odmówi użycia pliku z tokenem, jeśli jest czytelny dla kogokolwiek poza właścicielem.
+`sejfik` odmówi użycia pliku z kluczem, jeśli jest czytelny dla kogokolwiek poza właścicielem.
+
+Dwa klucze, celowo osobne:
+
+| plik | skąd | do czego |
+|---|---|---|
+| `~/.sejfik/token` | Konto → tokeny MCP | `run`, `inject`, `read`, `create-login`, `rotate-password` |
+| `~/.sejfik/send-token` | Konto → klucze przesyłek | `send` |
+
+Maszyna, która tylko wysyła zrzuty ekranu, potrzebuje wyłącznie drugiego.
 
 ## Użycie
 
@@ -125,6 +134,41 @@ dojechać do serwisu po drugiej stronie, nie zostawia nikogo bez dostępu.
 
 Uwaga: to zmienia hasło **w Sejfiku**, a nie w serwisie. Ustawienie go tam
 to osobny krok i nikt go za Ciebie nie zrobi.
+
+### `send` — zrzut ekranu jednym poleceniem
+
+```bash
+sejfik send --screen            # wybierz obszar, wyślij, dostań link
+sejfik send --screen --full     # cały ekran bez wybierania
+sejfik send --clipboard         # obraz ze schowka
+sejfik send zrzut.png raport.pdf --note "błąd na produkcji"
+```
+
+Link idzie na standardowe wyjście, opis na strumień błędów, więc to działa
+tak, jak wygląda:
+
+```bash
+LINK=$(sejfik send --screen)
+```
+
+Jeśli w systemie jest `wl-copy`, `xclip` albo `pbcopy`, link ląduje też
+w schowku. Zrzut robi pierwsze narzędzie, które znajdzie: `grim`+`slurp`,
+`gnome-screenshot`, `spectacle`, `maim`, `scrot`, ImageMagick, a na macOS
+wbudowany `screencapture`.
+
+Opcje przesyłki: `--hours`, `--downloads`, `--length` (6, 16, 22 albo 48
+znaków linku), `--note`.
+
+Wygodnie podwiązać to pod skrót klawiszowy systemu — wtedy wysłanie zrzutu
+to jedno naciśnięcie i wklejenie linku.
+
+**To polecenie używa innego klucza niż pozostałe.** Klucz przesyłek umie
+wyłącznie utworzyć przesyłkę: nie otwiera sejfu i nie czyta haseł. Dzięki
+temu maszyna, która tylko wysyła zrzuty, nie nosi klucza do sekretów.
+
+```bash
+install -m 600 /dev/stdin ~/.sejfik/send-token   # klucz z: Konto → klucze przesyłek
+```
 
 ### `whoami`
 

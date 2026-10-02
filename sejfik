@@ -26,10 +26,13 @@ import urllib.request
 from pathlib import Path
 from typing import Iterable
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 CONFIG_DIR = Path(os.environ.get("SEJFIK_HOME", Path.home() / ".sejfik"))
 TOKEN_FILE = CONFIG_DIR / "token"
+# Klucz do wysyłania przesyłek trzymamy OSOBNO od tokenu agenta: narzędzie,
+# które wrzuca zrzuty ekranu, nie ma powodu nosić klucza do haseł.
+SEND_TOKEN_FILE = CONFIG_DIR / "send-token"
 CONFIG_FILE = CONFIG_DIR / "config"
 
 REF_PATTERN = re.compile(r"^sejfik://item/(\d+)/(password|totp_code|login)$")
@@ -75,33 +78,44 @@ def resolve_url(explicit: str | None) -> str:
     return url.rstrip("/")
 
 
-def read_token() -> str:
-    """Token osobisty (PAT) ze zmiennej środowiskowej albo z pliku.
+def _read_secret_file(path: Path, env_names: tuple[str, ...], where: str) -> str:
+    """Sekret ze zmiennej środowiskowej albo z pliku o prawach 600.
 
-    Plik musi być czytelny wyłącznie dla właściciela. Token daje dostęp do
-    teczki agenta, więc `chmod 644` na nim to cicha dziura — lepiej odmówić
-    głośno niż działać.
+    Plik czytelny dla innych odrzucamy głośno. Cicha dziura w prawach
+    dostępu jest gorsza niż błąd, bo nikt jej nie zauważy.
     """
-    token = os.environ.get("SEJFIK_TOKEN") or os.environ.get("SEJFIK_AGENT_TOKEN")
-    if token:
-        return token.strip()
+    for name in env_names:
+        value = os.environ.get(name)
+        if value:
+            return value.strip()
 
-    if not TOKEN_FILE.exists():
+    if not path.exists():
         raise SejfikError(
-            f"brak tokenu. Ustaw SEJFIK_TOKEN albo zapisz go w {TOKEN_FILE} "
-            "(prawa 600). Token wygenerujesz w Sejfiku: Konto → tokeny MCP."
+            f"brak klucza. Ustaw {env_names[0]} albo zapisz go w {path} "
+            f"(prawa 600). Klucz wygenerujesz w Sejfiku: {where}."
         )
 
-    mode = TOKEN_FILE.stat().st_mode
-    if mode & (stat.S_IRWXG | stat.S_IRWXO):
-        raise SejfikError(
-            f"{TOKEN_FILE} jest czytelny dla innych użytkowników. Napraw: chmod 600 {TOKEN_FILE}"
-        )
+    if path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise SejfikError(f"{path} jest czytelny dla innych użytkowników. Napraw: chmod 600 {path}")
 
-    token = TOKEN_FILE.read_text(encoding="utf-8").strip()
-    if not token:
-        raise SejfikError(f"{TOKEN_FILE} jest pusty.")
-    return token
+    secret = path.read_text(encoding="utf-8").strip()
+    if not secret:
+        raise SejfikError(f"{path} jest pusty.")
+    return secret
+
+
+def read_token() -> str:
+    """Token agenta (PAT) — otwiera teczkę agenta."""
+    return _read_secret_file(
+        TOKEN_FILE, ("SEJFIK_TOKEN", "SEJFIK_AGENT_TOKEN"), "Konto → tokeny MCP"
+    )
+
+
+def read_send_token() -> str:
+    """Klucz przesyłek — umie wyłącznie utworzyć przesyłkę."""
+    return _read_secret_file(
+        SEND_TOKEN_FILE, ("SEJFIK_SEND_TOKEN",), "Konto → klucze przesyłek"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -356,6 +370,23 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--length", type=int, help="długość hasła (domyślnie 24)")
     create.set_defaults(handler=cmd_create_login)
 
+    send = subparsers.add_parser(
+        "send",
+        help="wyślij plik albo zrzut ekranu jako przesyłkę",
+        description="Wypisuje gotowy link na standardowe wyjście, a opis na strumień błędów, "
+                    "więc LINK=$(sejfik send --screen) działa tak, jak wygląda. "
+                    "Używa klucza przesyłek (~/.sejfik/send-token), nie tokenu agenta.",
+    )
+    send.add_argument("files", nargs="*", help="pliki do wysłania")
+    send.add_argument("--screen", action="store_true", help="zrób zrzut ekranu i wyślij go")
+    send.add_argument("--full", action="store_true", help="z --screen: cały ekran zamiast wyboru obszaru")
+    send.add_argument("--clipboard", action="store_true", help="wyślij obraz ze schowka")
+    send.add_argument("--note", help="notatka dołączona do przesyłki")
+    send.add_argument("--hours", type=int, help="po ilu godzinach link wygasa")
+    send.add_argument("--downloads", type=int, help="limit pobrań (0 = bez limitu)")
+    send.add_argument("--length", type=int, choices=[6, 16, 22, 48], help="długość linku w znakach")
+    send.set_defaults(handler=cmd_send)
+
     rotate = subparsers.add_parser("rotate-password", help="nowe hasło dla istniejącego wpisu")
     rotate.add_argument("item", help="numer wpisu albo sejfik://item/{id}/password")
     rotate.add_argument("--length", type=int, help="długość hasła (domyślnie 24)")
@@ -363,6 +394,229 @@ def build_parser() -> argparse.ArgumentParser:
 
     return parser
 
+
+
+
+# --------------------------------------------------------------------------
+# Wysyłanie przesyłek
+# --------------------------------------------------------------------------
+
+# Narzędzia do zrzutu ekranu, w kolejności prób. Pierwsze, które jest
+# w systemie, wygrywa; {out} to plik docelowy.
+SCREENSHOT_TOOLS = (
+    # Wayland
+    ["grim", "{out}"],
+    ["gnome-screenshot", "-f", "{out}"],
+    ["spectacle", "-b", "-n", "-o", "{out}"],
+    # X11
+    ["maim", "{out}"],
+    ["scrot", "{out}"],
+    ["import", "-window", "root", "{out}"],
+    # macOS
+    ["screencapture", "-x", "{out}"],
+)
+
+SCREENSHOT_TOOLS_INTERACTIVE = (
+    ["grim", "-g", "SLURP", "{out}"],  # obsługiwane osobno, patrz grab_screen
+    ["gnome-screenshot", "-a", "-f", "{out}"],
+    ["spectacle", "-b", "-n", "-r", "-o", "{out}"],
+    ["maim", "-s", "{out}"],
+    ["scrot", "-s", "{out}"],
+    ["screencapture", "-x", "-i", "{out}"],
+)
+
+CLIPBOARD_TOOLS = (
+    ["wl-paste", "--type", "image/png"],
+    ["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
+    ["pngpaste", "-"],
+)
+
+
+def _which(name: str) -> str | None:
+    import shutil
+
+    return shutil.which(name)
+
+
+def grab_screen(target: Path, interactive: bool) -> None:
+    """Zrzut ekranu do pliku, czymkolwiek, co jest w systemie."""
+    import subprocess
+
+    tools = SCREENSHOT_TOOLS_INTERACTIVE if interactive else SCREENSHOT_TOOLS
+
+    for tool in tools:
+        binary = tool[0]
+        if not _which(binary):
+            continue
+
+        command = [part.replace("{out}", str(target)) for part in tool]
+
+        # grim sam nie wybiera obszaru — robi to slurp.
+        if binary == "grim" and interactive:
+            if not _which("slurp"):
+                continue
+            region = subprocess.run(["slurp"], capture_output=True, text=True)
+            if region.returncode != 0 or not region.stdout.strip():
+                raise SejfikError("zrzut przerwany.")
+            command = ["grim", "-g", region.stdout.strip(), str(target)]
+
+        result = subprocess.run(command, capture_output=True)
+        if result.returncode == 0 and target.exists() and target.stat().st_size > 0:
+            return
+
+        raise SejfikError(
+            f"{binary} nie zrobił zrzutu: {result.stderr.decode(errors='replace').strip() or 'przerwane'}"
+        )
+
+    raise SejfikError(
+        "nie znalazłem narzędzia do zrzutu ekranu. Zainstaluj jedno z: "
+        "grim+slurp, gnome-screenshot, spectacle, maim, scrot, imagemagick "
+        "(na macOS screencapture jest wbudowany). Albo podaj plik: sejfik send plik.png"
+    )
+
+
+def grab_clipboard(target: Path) -> None:
+    """Obraz ze schowka do pliku."""
+    import subprocess
+
+    for tool in CLIPBOARD_TOOLS:
+        if not _which(tool[0]):
+            continue
+
+        result = subprocess.run(tool, capture_output=True)
+        if result.returncode == 0 and result.stdout:
+            target.write_bytes(result.stdout)
+            return
+
+    raise SejfikError(
+        "nie wyjąłem obrazu ze schowka. Potrzebny wl-paste, xclip albo pngpaste, "
+        "a w schowku musi być obraz, nie tekst."
+    )
+
+
+def _multipart(fields: dict[str, str], files: list[Path]) -> tuple[bytes, str]:
+    """Ciało multipart/form-data. Stdlib Pythona nie ma na to gotowca."""
+    import mimetypes
+    import uuid
+
+    boundary = "----sejfik" + uuid.uuid4().hex
+    out = bytearray()
+
+    for name, value in fields.items():
+        out += f"--{boundary}\r\n".encode()
+        out += f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        out += str(value).encode("utf-8") + b"\r\n"
+
+    for path in files:
+        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        out += f"--{boundary}\r\n".encode()
+        out += (
+            f'Content-Disposition: form-data; name="files[]"; filename="{path.name}"\r\n'
+        ).encode("utf-8")
+        out += f"Content-Type: {mime}\r\n\r\n".encode()
+        out += path.read_bytes() + b"\r\n"
+
+    out += f"--{boundary}--\r\n".encode()
+
+    return bytes(out), f"multipart/form-data; boundary={boundary}"
+
+
+def copy_to_clipboard(text: str) -> bool:
+    import subprocess
+
+    for tool in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["pbcopy"]):
+        if not _which(tool[0]):
+            continue
+        try:
+            subprocess.run(tool, input=text.encode(), timeout=5, check=True)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    import tempfile
+
+    files = [Path(p) for p in args.files]
+    for path in files:
+        if not path.is_file():
+            raise SejfikError(f"nie ma pliku {path}")
+
+    tmpdir = None
+    if args.screen or args.clipboard:
+        tmpdir = tempfile.TemporaryDirectory()
+        target = Path(tmpdir.name) / ("zrzut-" + __import__("time").strftime("%Y%m%d-%H%M%S") + ".png")
+        if args.screen:
+            grab_screen(target, interactive=not args.full)
+        else:
+            grab_clipboard(target)
+        files.append(target)
+
+    if not files and not args.note:
+        raise SejfikError("nie ma czego wysłać. Podaj plik, --screen, --clipboard albo --note.")
+
+    fields: dict[str, str] = {}
+    if args.note:
+        fields["note"] = args.note
+    if args.hours:
+        fields["hours"] = str(args.hours)
+    if args.downloads is not None:
+        fields["downloads"] = str(args.downloads)
+    if args.length:
+        fields["length"] = str(args.length)
+
+    body, content_type = _multipart(fields, files)
+
+    request = urllib.request.Request(
+        resolve_url(args.url_base) + "/api/transfers",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {read_send_token()}",
+            "Content-Type": content_type,
+            "Accept": "application/json",
+            "User-Agent": f"sejfik-cli/{__version__}",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        detail = ""
+        try:
+            detail = json.loads(error.read().decode("utf-8")).get("error", "")
+        except Exception:
+            pass
+        if error.code == 401:
+            raise SejfikError(
+                "Sejfik nie uznał klucza przesyłek. Wygeneruj nowy: Konto → klucze przesyłek."
+            ) from None
+        raise SejfikError(f"Sejfik odmówił ({error.code}). {detail}".strip()) from None
+    except urllib.error.URLError as error:
+        raise SejfikError(f"nie udało się połączyć z Sejfikiem: {error.reason}") from None
+    finally:
+        if tmpdir is not None:
+            tmpdir.cleanup()
+
+    url = payload.get("url")
+    if not url:
+        raise SejfikError("Sejfik nie zwrócił linku.")
+
+    opis = []
+    if payload.get("expires_at"):
+        opis.append("wygasa " + str(payload["expires_at"])[:16].replace("T", " "))
+    if payload.get("download_limit"):
+        opis.append(f"pobrań: {payload['download_limit']}")
+    if copy_to_clipboard(url):
+        opis.append("skopiowany do schowka")
+
+    if opis:
+        print("Przesyłka gotowa — " + ", ".join(opis) + ".", file=sys.stderr)
+    # Sam link na wyjście, żeby dało się go złapać w skrypcie i w agencie.
+    print(url)
+    return 0
 
 
 def item_id_from(target: str) -> int:

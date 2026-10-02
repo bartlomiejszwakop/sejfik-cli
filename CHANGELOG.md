@@ -1,5 +1,19 @@
 # Historia zmian
 
+## 1.2.0 — 2026-10-02
+
+- `send` — wysyła plik, zrzut ekranu (`--screen`) albo obraz ze schowka
+  (`--clipboard`) jako przesyłkę i wypisuje gotowy link. Zrzut robi
+  pierwsze dostępne narzędzie: grim+slurp, gnome-screenshot, spectacle,
+  maim, scrot, ImageMagick, screencapture. Link ląduje też w schowku,
+  jeśli jest czym go tam wstawić.
+
+Używa osobnego klucza (`~/.sejfik/send-token`, `SEJFIK_SEND_TOKEN`), który
+umie wyłącznie utworzyć przesyłkę. Maszyna wysyłająca zrzuty nie ma powodu
+nosić klucza do haseł, a jeden klucz do wszystkiego oznaczałby dokładnie to.
+
+Wymaga Sejfika z endpointem POST /api/transfers.
+
 ## 1.1.0 — 2026-09-29
 
 Domknięcie cyklu życia hasła: dotąd klient umiał hasło wskazać i użyć,

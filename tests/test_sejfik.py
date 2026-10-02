@@ -35,6 +35,7 @@ SECRETS = {
 
 class FakeSejfik(BaseHTTPRequestHandler):
     tokens_seen: list[str] = []
+    last_upload: bytes = b""
 
     def log_message(self, *args):  # cisza w trakcie testów
         pass
@@ -56,7 +57,20 @@ class FakeSejfik(BaseHTTPRequestHandler):
     def do_POST(self):
         FakeSejfik.tokens_seen.append(self.headers.get("Authorization", ""))
         length = int(self.headers.get("Content-Length", 0))
-        payload = json.loads(self.rfile.read(length) or b"{}")
+        raw = self.rfile.read(length)
+
+        if self.path == "/api/transfers":
+            if not self.headers.get("Authorization", "").endswith("klucz-przesylek"):
+                return self._json(401, {"ok": False, "error": "Klucz nieprawidłowy albo odwołany."})
+            FakeSejfik.last_upload = raw
+            return self._json(201, {
+                "ok": True,
+                "url": "https://sejfik.example/s/abcdef1234567890",
+                "expires_at": "2026-10-03T12:00:00+00:00",
+                "download_limit": None,
+            })
+
+        payload = json.loads(raw or b"{}")
 
         if self.path == "/api/vault/agent/items":
             if not payload.get("name"):
@@ -304,6 +318,93 @@ class TestZakladanie(Base):
         wynik = self._run(["rotate-password", "999"])
         self.assertEqual(2, wynik.returncode)
         self.assertIn("sejfik:", wynik.stderr)
+
+
+class TestWysylanie(Base):
+    def setUp(self):
+        super().setUp()
+        os.environ["SEJFIK_SEND_TOKEN"] = "klucz-przesylek"
+        sejfik.SEND_TOKEN_FILE = Path(self.home.name) / "send-token"
+
+    def tearDown(self):
+        os.environ.pop("SEJFIK_SEND_TOKEN", None)
+        super().tearDown()
+
+    def _run(self, args: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(ROOT / "sejfik"), *args],
+            capture_output=True, text=True, env=os.environ.copy(), timeout=60,
+        )
+
+    def test_plik_leci_i_link_wraca_na_wyjscie(self):
+        plik = Path(self.home.name) / "zrzut.png"
+        plik.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+
+        wynik = self._run(["send", str(plik), "--note", "Blad na produkcji"])
+
+        self.assertEqual(0, wynik.returncode, wynik.stderr)
+        # Dokładnie to, co złapie LINK=$(sejfik send ...).
+        self.assertEqual("https://sejfik.example/s/abcdef1234567890", wynik.stdout.strip())
+        self.assertIn("Przesyłka gotowa", wynik.stderr)
+
+    def test_plik_naprawde_dociera_w_multipart(self):
+        plik = Path(self.home.name) / "zrzut.png"
+        plik.write_bytes(b"\x89PNG-TRESC-PLIKU")
+        self._run(["send", str(plik), "--note", "opis"])
+
+        wyslane = FakeSejfik.last_upload
+        self.assertIn(b"PNG-TRESC-PLIKU", wyslane)
+        self.assertIn(b'name="files[]"; filename="zrzut.png"', wyslane)
+        self.assertIn(b"opis", wyslane)
+
+    def test_opcje_ida_do_serwera(self):
+        plik = Path(self.home.name) / "a.png"
+        plik.write_bytes(b"x")
+        self._run(["send", str(plik), "--hours", "1", "--downloads", "1", "--length", "48"])
+
+        wyslane = FakeSejfik.last_upload
+        for oczekiwane in (b'name="hours"', b'name="downloads"', b'name="length"', b"48"):
+            self.assertIn(oczekiwane, wyslane)
+
+    def test_bez_niczego_nie_wysyla(self):
+        wynik = self._run(["send"])
+        self.assertEqual(2, wynik.returncode)
+        self.assertIn("nie ma czego wysłać", wynik.stderr)
+
+    def test_brakujacy_plik_mowi_ktory(self):
+        wynik = self._run(["send", "/nie/ma/takiego.png"])
+        self.assertEqual(2, wynik.returncode)
+        self.assertIn("nie ma pliku", wynik.stderr)
+
+    def test_uzywa_klucza_przesylek_a_nie_tokenu_agenta(self):
+        # Token agenta nie ma prawa wysyłać przesyłek i odwrotnie.
+        plik = Path(self.home.name) / "a.png"
+        plik.write_bytes(b"x")
+        os.environ["SEJFIK_SEND_TOKEN"] = "token-testowy"  # to jest token AGENTA
+
+        wynik = self._run(["send", str(plik)])
+
+        self.assertEqual(2, wynik.returncode)
+        self.assertIn("klucza przesyłek", wynik.stderr)
+
+    def test_brak_klucza_mowi_gdzie_go_wziac(self):
+        os.environ.pop("SEJFIK_SEND_TOKEN")
+        plik = Path(self.home.name) / "a.png"
+        plik.write_bytes(b"x")
+
+        wynik = self._run(["send", str(plik)])
+
+        self.assertEqual(2, wynik.returncode)
+        self.assertIn("klucze przesyłek", wynik.stderr)
+
+    def test_plik_klucza_czytelny_dla_innych_jest_odrzucany(self):
+        os.environ.pop("SEJFIK_SEND_TOKEN")
+        sejfik.SEND_TOKEN_FILE.write_text("klucz-przesylek")
+        sejfik.SEND_TOKEN_FILE.chmod(0o644)
+
+        with self.assertRaises(sejfik.SejfikError) as ctx:
+            sejfik.read_send_token()
+        self.assertIn("chmod 600", str(ctx.exception))
 
 
 if __name__ == "__main__":
